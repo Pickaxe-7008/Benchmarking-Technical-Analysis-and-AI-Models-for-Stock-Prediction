@@ -3,49 +3,56 @@
 # =============================================================================
 #
 # 1) Walk-forward CV (train-only):
-#    - ACC   : Accuracy averaged across CV folds
-#    - PREC  : Precision
-#    - REC   : Recall
-#    - F1    : F1-score
-#    - ROC   : ROC-AUC
-#    → Evaluates stability of the model on training data splits.
+#    Classification (task="clf"):
+#      - ACC   : Accuracy averaged across CV folds
+#      - PREC  : Precision
+#      - REC   : Recall
+#      - F1    : F1-score
+#      - ROC   : ROC-AUC
+#      → Evaluates stability of the model on training data splits.
+#
+#    Regression (task="reg"):
+#      - MAE   : Mean Absolute Error (lower is better)
+#      - RMSE  : Root Mean Squared Error (lower is better)
+#      - R2    : Coefficient of Determination (higher is better)
+#      → Evaluates stability of the model on training data splits.
 #
 # 2) Holdout (last segment):
-#    - ACC   : Accuracy on most recent unseen data
-#    - PREC  : Precision (UP class)
-#    - REC   : Recall (UP class)
-#    - F1    : F1-score
-#    - ROC   : ROC-AUC
-#    → True out-of-sample performance.
+#    Classification:
+#      - ACC, PREC, REC, F1, ROC (as above) → True out-of-sample performance.
+#    Regression:
+#      - MAE, RMSE, R2 → True out-of-sample performance.
 #
 # 3) Top features:
-#    - For RandomForest → "importance" = Gini importance
-#    - For Logistic     → "abs_coef"   = |regression coefficient|
+#    - RandomForest (clf/reg) → "importance" = Gini/MSE-based importances
+#    - Logistic (clf)         → "abs_coef"   = |regression coefficient|
+#    - Linear/Ridge (reg)     → "abs_coef"   = |regression coefficient|
 #    → Larger = stronger influence in the trained model.
 #
-# 4) Per-feature univariate ROC-AUC (holdout):
-#    - Table: feature name, ROC-AUC score
-#    - Each feature trained/evaluated alone.
+# 4) Univariate (holdout):
+#    - Classification → per-feature ROC-AUC when trained alone
+#    - Regression     → per-feature R^2 on holdout when trained alone
 #    → Measures standalone predictive power of each indicator.
 #
 # 5) Group permutation importance (holdout):
-#    - group             : Indicator family (SMA, EMA, RSI, MACD, BOLL, STOCH, ATR, OBV, RET/VOL)
-#    - baseline_auc      : Model’s AUC on clean data
-#    - shuffled_auc_mean : Mean AUC after shuffling features in that group
-#    - auc_drop          : baseline_auc − shuffled_auc_mean
+#    Classification:
+#      - group, baseline_auc, shuffled_auc_mean, auc_drop
+#    Regression:
+#      - group, baseline_r2, shuffled_r2_mean, r2_drop
 #    → Larger drop = more important family of indicators to the model.
 #
 # 6) Last 10 predictions (from holdout):
-#    - y_true    : Realized outcome (0 = down, 1 = up)
-#    - y_prob_up : Predicted probability of price going UP
-#    - y_pred_up : Hard classification at threshold 0.5
+#    Classification:
+#      - y_true (0/1), y_prob_up, y_pred_up (threshold 0.5)
+#    Regression:
+#      - y_true (future return over horizon), y_pred
 #    → Quick sanity check of most recent predictions.
 #
 # =============================================================================
 
 import argparse
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Union
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -53,10 +60,19 @@ import yfinance as yf
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
+
+# Classifiers
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
+
+# Regressors
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.ensemble import RandomForestRegressor
+
+# Metrics
 from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
+    r2_score, mean_absolute_error, mean_squared_error
 )
 
 # ---------------------
@@ -71,7 +87,12 @@ class Config:
     interval: str = "1d"           # Daily data
     horizon: int = 1               # Predict 1 day ahead
     test_ratio: float = 0.2        # Last 20% of data = holdout
-    model: str = "logit"           # "logit" or "rf"
+
+    # TASK / MODEL:
+    #   task="clf" with model in {"logit","rf"}
+    #   task="reg" with model in {"linreg","ridge","rf"}
+    task: str = "reg"
+    model: str = "ridge"
 
     # Indicator windows
     sma_windows: List[int] = field(default_factory=lambda: [10, 20, 50, 200])
@@ -91,6 +112,7 @@ class Config:
     n_splits: int = 5
     random_state: int = 42
     class_weight: str = "balanced" # For logistic regression
+
 
 # ---------------------
 # Data & Indicators
@@ -252,52 +274,95 @@ def build_features(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     feats = feats.replace([np.inf, -np.inf], np.nan).dropna()
     return feats
 
-def make_labels(close: pd.Series, horizon: int) -> pd.Series:
+
+def make_labels(close: pd.Series, horizon: int, task: str) -> pd.Series:
+    """
+    Classification: binary UP/DOWN (future close > current close).
+    Regression    : future return over 'horizon' days: (future/now - 1).
+    """
     future = close.shift(-horizon)
-    y = (future > close).astype(int)
+    if task == "clf":
+        y = (future > close).astype(int)
+    elif task == "reg":
+        y = (future / close) - 1.0
+    else:
+        raise ValueError("task must be 'clf' or 'reg'")
     return y
+
 
 def align_features_labels(feats: pd.DataFrame, y: pd.Series) -> Tuple[pd.DataFrame, pd.Series]:
     df = feats.join(y.rename("y"), how="inner")
     df = df.dropna(subset=["y"])
     X = df.drop(columns=["y"])
-    y = df["y"].astype(int)
+    y = df["y"]
     return X, y
+
 
 # ---------------------
 # Modeling
 # ---------------------
 
 def make_model(cfg: Config):
-    if cfg.model == "logit":
-        clf = LogisticRegression(max_iter=500, class_weight=cfg.class_weight)
-        pipe = Pipeline([
-            ("scaler", StandardScaler(with_mean=True, with_std=True)),
-            ("clf", clf),
-        ])
-        return pipe
-    elif cfg.model == "rf":
-        clf = RandomForestClassifier(
-            n_estimators=400, max_depth=None, min_samples_leaf=3,
-            random_state=cfg.random_state, n_jobs=-1
-        )
-        return clf
+    if cfg.task == "clf":
+        if cfg.model == "logit":
+            clf = LogisticRegression(max_iter=500, class_weight=cfg.class_weight)
+            pipe = Pipeline([
+                ("scaler", StandardScaler(with_mean=True, with_std=True)),
+                ("clf", clf),
+            ])
+            return pipe
+        elif cfg.model == "rf":
+            clf = RandomForestClassifier(
+                n_estimators=400, max_depth=None, min_samples_leaf=3,
+                random_state=cfg.random_state, n_jobs=-1
+            )
+            return clf
+        else:
+            raise ValueError("Unsupported classifier. Use 'logit' or 'rf'.")
+    elif cfg.task == "reg":
+        if cfg.model == "linreg":
+            reg = LinearRegression()
+            pipe = Pipeline([
+                ("scaler", StandardScaler(with_mean=True, with_std=True)),
+                ("reg", reg),
+            ])
+            return pipe
+        elif cfg.model == "ridge":
+            reg = Ridge(alpha=1.0, random_state=cfg.random_state)
+            pipe = Pipeline([
+                ("scaler", StandardScaler(with_mean=True, with_std=True)),
+                ("reg", reg),
+            ])
+            return pipe
+        elif cfg.model == "rf":
+            reg = RandomForestRegressor(
+                n_estimators=400, max_depth=None, min_samples_leaf=3,
+                random_state=cfg.random_state, n_jobs=-1
+            )
+            return reg
+        else:
+            raise ValueError("Unsupported regressor. Use 'linreg', 'ridge', or 'rf'.")
     else:
-        raise ValueError("Unsupported model")
+        raise ValueError("task must be 'clf' or 'reg'")
+
 
 def make_clone(model):
     """
     Lightweight clone to avoid sklearn.clone complexities with pipelines.
     """
     if isinstance(model, Pipeline):
-        # Recreate a similar pipeline
         steps = []
         for name, est in model.steps:
             if name == "scaler" and isinstance(est, StandardScaler):
                 steps.append(("scaler", StandardScaler(with_mean=True, with_std=True)))
             elif name == "clf" and isinstance(est, LogisticRegression):
                 steps.append(("clf", LogisticRegression(max_iter=500, class_weight=est.class_weight)))
+            elif name == "reg" and isinstance(est, LinearRegression):
+                steps.append(("reg", LinearRegression()))
+            elif name == "reg" and isinstance(est, Ridge):
+                steps.append(("reg", Ridge(alpha=est.alpha, random_state=getattr(est, "random_state", None))))
         return Pipeline(steps)
+
     if isinstance(model, RandomForestClassifier):
         return RandomForestClassifier(
             n_estimators=model.n_estimators,
@@ -306,16 +371,34 @@ def make_clone(model):
             random_state=model.random_state,
             n_jobs=model.n_jobs,
         )
+    if isinstance(model, RandomForestRegressor):
+        return RandomForestRegressor(
+            n_estimators=model.n_estimators,
+            max_depth=model.max_depth,
+            min_samples_leaf=model.min_samples_leaf,
+            random_state=model.random_state,
+            n_jobs=model.n_jobs,
+        )
     return model
 
-def safe_predict_proba(model, X: pd.DataFrame) -> np.ndarray:
-    if hasattr(model, "predict_proba"):
-        return model.predict_proba(X)[:, 1]
-    if hasattr(model, "decision_function"):
-        s = model.decision_function(X)
-        return 1 / (1 + np.exp(-s))
-    # Fallback to class labels
-    return model.predict(X)
+
+def predict_scores(model, X: pd.DataFrame, task: str) -> np.ndarray:
+    """
+    For classification: returns P(y=1).
+    For regression: returns point predictions (future returns).
+    """
+    if task == "clf":
+        if hasattr(model, "predict_proba"):
+            return model.predict_proba(X)[:, 1]
+        if hasattr(model, "decision_function"):
+            s = model.decision_function(X)
+            return 1 / (1 + np.exp(-s))
+        # Fallback to class labels mapped to {0,1}
+        preds = model.predict(X)
+        return (preds > 0).astype(float)
+    else:
+        return model.predict(X)
+
 
 def train_test_split_time(X: pd.DataFrame, y: pd.Series, test_ratio: float) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
     n = len(X)
@@ -324,28 +407,32 @@ def train_test_split_time(X: pd.DataFrame, y: pd.Series, test_ratio: float) -> T
     ytr, yte = y.iloc[:split], y.iloc[split:]
     return Xtr, Xte, ytr, yte
 
-def feature_importance(model, X_cols: List[str]) -> pd.DataFrame:
-    if isinstance(model, RandomForestClassifier):
+
+def feature_importance(model, X_cols: List[str], task: str) -> pd.DataFrame:
+    # Tree-based: same for clf/reg
+    if isinstance(model, (RandomForestClassifier, RandomForestRegressor)):
         imp = pd.Series(model.feature_importances_, index=X_cols)
         return imp.sort_values(ascending=False).to_frame("importance")
-    if isinstance(model, Pipeline) and isinstance(model.named_steps.get("clf"), LogisticRegression):
-        clf = model.named_steps["clf"]
-        coefs = clf.coef_.ravel()
-        imp = pd.Series(np.abs(coefs), index=X_cols)
-        return imp.sort_values(ascending=False).to_frame("abs_coef")
+
+    # Linear models inside pipelines
+    if isinstance(model, Pipeline):
+        if task == "clf" and isinstance(model.named_steps.get("clf"), LogisticRegression):
+            coefs = model.named_steps["clf"].coef_.ravel()
+            imp = pd.Series(np.abs(coefs), index=X_cols)
+            return imp.sort_values(ascending=False).to_frame("abs_coef")
+        if task == "reg":
+            est = model.named_steps.get("reg")
+            if isinstance(est, (LinearRegression, Ridge)):
+                coefs = est.coef_.ravel()
+                imp = pd.Series(np.abs(coefs), index=X_cols)
+                return imp.sort_values(ascending=False).to_frame("abs_coef")
+
     return pd.DataFrame()
+
 
 # ---------------------
 # Indicator performance diagnostics
 # ---------------------
-
-def _safe_auc(y_true, scores) -> float:
-    try:
-        if len(np.unique(y_true)) < 2:
-            return np.nan
-        return roc_auc_score(y_true, scores)
-    except Exception:
-        return np.nan
 
 def group_features(X_cols: List[str]) -> Dict[str, List[str]]:
     groups: Dict[str, List[str]] = {
@@ -376,87 +463,170 @@ def group_features(X_cols: List[str]) -> Dict[str, List[str]]:
             groups["RET/VOL"].append(c)
     return {g: cols for g, cols in groups.items() if len(cols) > 0}
 
-def univariate_holdout_auc(Xtr: pd.DataFrame, ytr: pd.Series,
-                           Xte: pd.DataFrame, yte: pd.Series) -> pd.DataFrame:
+
+def univariate_holdout_diag(task: str,
+                            Xtr: pd.DataFrame, ytr: pd.Series,
+                            Xte: pd.DataFrame, yte: pd.Series) -> pd.DataFrame:
+    """
+    Classification: ROC-AUC per feature (logit on single feature).
+    Regression    : R^2 per feature (linear regression on single feature).
+    """
     results = []
     for col in Xtr.columns:
         if np.isclose(Xtr[col].std(ddof=0), 0.0) or Xtr[col].isna().all():
             results.append((col, np.nan))
             continue
-        pipe = Pipeline([
-            ("scaler", StandardScaler(with_mean=True, with_std=True)),
-            ("clf", LogisticRegression(max_iter=500, class_weight="balanced"))
-        ])
-        try:
-            pipe.fit(Xtr[[col]], ytr)
-            proba = safe_predict_proba(pipe, Xte[[col]])
-            auc = _safe_auc(yte, proba)
-        except Exception:
-            auc = np.nan
-        results.append((col, auc))
-    df = pd.DataFrame(results, columns=["feature", "univariate_auc"]).sort_values("univariate_auc", ascending=False)
+        if task == "clf":
+            pipe = Pipeline([
+                ("scaler", StandardScaler(with_mean=True, with_std=True)),
+                ("clf", LogisticRegression(max_iter=500, class_weight="balanced"))
+            ])
+            try:
+                pipe.fit(Xtr[[col]], ytr.astype(int))
+                proba = predict_scores(pipe, Xte[[col]], task="clf")
+                if len(np.unique(yte)) < 2:
+                    score = np.nan
+                else:
+                    score = roc_auc_score(yte.astype(int), proba)
+            except Exception:
+                score = np.nan
+            results.append((col, score))
+        else:
+            pipe = Pipeline([
+                ("scaler", StandardScaler(with_mean=True, with_std=True)),
+                ("reg", LinearRegression())
+            ])
+            try:
+                pipe.fit(Xtr[[col]], ytr.astype(float))
+                pred = predict_scores(pipe, Xte[[col]], task="reg")
+                score = r2_score(yte.astype(float), pred)
+            except Exception:
+                score = np.nan
+            results.append((col, score))
+
+    colname = "univariate_auc" if task == "clf" else "univariate_r2"
+    df = pd.DataFrame(results, columns=["feature", colname]).sort_values(colname, ascending=False)
     return df
 
-def group_permutation_importance(model, Xte: pd.DataFrame, yte: pd.Series,
+
+def group_permutation_importance(task: str,
+                                 model,
+                                 Xte: pd.DataFrame, yte: pd.Series,
                                  groups: Dict[str, List[str]],
                                  n_repeats: int = 5, seed: int = 42) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
-    baseline_scores = safe_predict_proba(model, Xte)
-    baseline_auc = _safe_auc(yte, baseline_scores)
+    base_pred = predict_scores(model, Xte, task)
+    if task == "clf":
+        baseline = np.nan
+        if len(np.unique(yte)) >= 2:
+            baseline = roc_auc_score(yte.astype(int), base_pred)
+        rows = []
+        for g, cols in groups.items():
+            aucs = []
+            for _ in range(n_repeats):
+                Xperm = Xte.copy()
+                for c in cols:
+                    if c not in Xperm.columns:
+                        continue
+                    shuffled = Xperm[c].to_numpy().copy()
+                    rng.shuffle(shuffled)
+                    Xperm[c] = shuffled
+                scores = predict_scores(model, Xperm, task)
+                if len(np.unique(yte)) >= 2:
+                    aucs.append(roc_auc_score(yte.astype(int), scores))
+                else:
+                    aucs.append(np.nan)
+            mean_shuf = np.nanmean(aucs) if len(aucs) else np.nan
+            drop = (baseline - mean_shuf) if (not np.isnan(baseline) and not np.isnan(mean_shuf)) else np.nan
+            rows.append((g, baseline, mean_shuf, drop))
+        out = pd.DataFrame(rows, columns=["group", "baseline_auc", "shuffled_auc_mean", "auc_drop"])
+        return out.sort_values("auc_drop", ascending=False)
+    else:
+        baseline = r2_score(yte.astype(float), base_pred.astype(float))
+        rows = []
+        for g, cols in groups.items():
+            r2s = []
+            for _ in range(n_repeats):
+                Xperm = Xte.copy()
+                for c in cols:
+                    if c not in Xperm.columns:
+                        continue
+                    shuffled = Xperm[c].to_numpy().copy()
+                    rng.shuffle(shuffled)
+                    Xperm[c] = shuffled
+                pred = predict_scores(model, Xperm, task)
+                r2s.append(r2_score(yte.astype(float), pred.astype(float)))
+            mean_shuf = np.nanmean(r2s) if len(r2s) else np.nan
+            drop = (baseline - mean_shuf) if (not np.isnan(baseline) and not np.isnan(mean_shuf)) else np.nan
+            rows.append((g, baseline, mean_shuf, drop))
+        out = pd.DataFrame(rows, columns=["group", "baseline_r2", "shuffled_r2_mean", "r2_drop"])
+        return out.sort_values("r2_drop", ascending=False)
 
-    rows = []
-    for g, cols in groups.items():
-        aucs = []
-        for _ in range(n_repeats):
-            Xperm = Xte.copy()
-            for c in cols:
-                if c not in Xperm.columns:
-                    continue
-                shuffled = Xperm[c].to_numpy().copy()
-                rng.shuffle(shuffled)
-                Xperm[c] = shuffled
-            scores = safe_predict_proba(model, Xperm)
-            aucs.append(_safe_auc(yte, scores))
-        mean_shuf_auc = np.nanmean(aucs) if len(aucs) else np.nan
-        importance = (baseline_auc - mean_shuf_auc) if (not np.isnan(baseline_auc) and not np.isnan(mean_shuf_auc)) else np.nan
-        rows.append((g, baseline_auc, mean_shuf_auc, importance))
-    out = pd.DataFrame(rows, columns=["group", "baseline_auc", "shuffled_auc_mean", "auc_drop"])
-    out = out.sort_values("auc_drop", ascending=False)
-    return out
 
 # ---------------------
 # Orchestration
 # ---------------------
 
-def walkforward_cv(model, X: pd.DataFrame, y: pd.Series, n_splits: int) -> Dict[str, float]:
+def walkforward_cv(task: str, model, X: pd.DataFrame, y: pd.Series, n_splits: int) -> Dict[str, float]:
     tscv = TimeSeriesSplit(n_splits=n_splits)
-    mets = {"acc": [], "prec": [], "rec": [], "f1": [], "roc": []}
-    for train_idx, val_idx in tscv.split(X):
-        Xtr, Xva = X.iloc[train_idx], X.iloc[val_idx]
-        ytr, yva = y.iloc[train_idx], y.iloc[val_idx]
-        model_ = make_clone(model)
-        model_.fit(Xtr, ytr)
-        proba = safe_predict_proba(model_, Xva)
-        pred = (proba >= 0.5).astype(int)
-        mets["acc"].append(accuracy_score(yva, pred))
-        mets["prec"].append(precision_score(yva, pred, zero_division=0))
-        mets["rec"].append(recall_score(yva, pred, zero_division=0))
-        mets["f1"].append(f1_score(yva, pred, zero_division=0))
-        if len(np.unique(yva)) == 2:
-            mets["roc"].append(roc_auc_score(yva, proba))
-    return {k: float(np.mean(v)) if v else np.nan for k, v in mets.items()}
+    if task == "clf":
+        mets = {"acc": [], "prec": [], "rec": [], "f1": [], "roc": []}
+        for train_idx, val_idx in tscv.split(X):
+            Xtr, Xva = X.iloc[train_idx], X.iloc[val_idx]
+            ytr, yva = y.iloc[train_idx].astype(int), y.iloc[val_idx].astype(int)
+            model_ = make_clone(model)
+            model_.fit(Xtr, ytr)
+            proba = predict_scores(model_, Xva, task)
+            pred = (proba >= 0.5).astype(int)
+            mets["acc"].append(accuracy_score(yva, pred))
+            mets["prec"].append(precision_score(yva, pred, zero_division=0))
+            mets["rec"].append(recall_score(yva, pred, zero_division=0))
+            mets["f1"].append(f1_score(yva, pred, zero_division=0))
+            if len(np.unique(yva)) == 2:
+                mets["roc"].append(roc_auc_score(yva, proba))
+        return {k: float(np.mean(v)) if v else np.nan for k, v in mets.items()}
+
+    else:
+        mets = {"mae": [], "rmse": [], "r2": []}
+        for train_idx, val_idx in tscv.split(X):
+            Xtr, Xva = X.iloc[train_idx], X.iloc[val_idx]
+            ytr, yva = y.iloc[train_idx].astype(float), y.iloc[val_idx].astype(float)
+            model_ = make_clone(model)
+            model_.fit(Xtr, ytr)
+            pred = predict_scores(model_, Xva, task)
+            mets["mae"].append(mean_absolute_error(yva, pred))
+            mets["rmse"].append(np.sqrt(mean_squared_error(yva, pred)))
+            mets["r2"].append(r2_score(yva, pred))
+        return {k: float(np.mean(v)) if v else np.nan for k, v in mets.items()}
+
 
 def main():
+    # Optional CLI (kept simple/optional to avoid breaking defaults)
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--task", choices=["clf", "reg"])
+    parser.add_argument("--model")
+    parser.add_argument("--ticker")
+    parser.add_argument("--years", type=int)
+    parser.add_argument("--horizon", type=int)
+    parser.add_argument("--test_ratio", type=float)
+    args, _ = parser.parse_known_args()
+
     cfg = Config()
+    if args.task: cfg.task = args.task
+    if args.model: cfg.model = args.model
+    if args.ticker: cfg.ticker = args.ticker
+    if args.years: cfg.period_years = args.years
+    if args.horizon: cfg.horizon = args.horizon
+    if args.test_ratio: cfg.test_ratio = args.test_ratio
 
     print(f"\nTicker: {cfg.ticker} | Period: {cfg.period_years}y | Interval: {cfg.interval}")
-    print(f"Horizon: {cfg.horizon}d  | Model: {cfg.model} | Test ratio: {cfg.test_ratio}\n")
+    print(f"Horizon: {cfg.horizon}d  | Task: {cfg.task} | Model: {cfg.model} | Test ratio: {cfg.test_ratio}\n")
 
     raw = fetch_ohlcv(cfg)
     feats = build_features(raw, cfg)
 
     # Align labels
-    y = make_labels(raw["Close"].reindex(feats.index), cfg.horizon)
+    y = make_labels(raw["Close"].reindex(feats.index), cfg.horizon, cfg.task)
     X, y = align_features_labels(feats, y)
 
     # Train/test split
@@ -466,35 +636,48 @@ def main():
     model = make_model(cfg)
 
     # Walk-forward CV (train only)
-    cv_metrics = walkforward_cv(model, Xtr, ytr, cfg.n_splits)
+    cv_metrics = walkforward_cv(cfg.task, model, Xtr, ytr, cfg.n_splits)
     print("Walk-forward CV (train-only):")
     for k, v in cv_metrics.items():
         print(f"  {k.upper():<5}: {v:.4f}")
     print()
 
     # Fit on full train and evaluate holdout
-    model.fit(Xtr, ytr)
-    proba_te = safe_predict_proba(model, Xte)
-    pred_te = (proba_te >= 0.5).astype(int)
+    model.fit(Xtr, ytr if cfg.task == "reg" else ytr.astype(int))
 
-    holdout = {
-        "ACC": accuracy_score(yte, pred_te),
-        "PREC": precision_score(yte, pred_te, zero_division=0),
-        "REC": recall_score(yte, pred_te, zero_division=0),
-        "F1": f1_score(yte, pred_te, zero_division=0),
-    }
-    try:
-        holdout["ROC"] = roc_auc_score(yte, proba_te)
-    except Exception:
-        holdout["ROC"] = np.nan
+    if cfg.task == "clf":
+        proba_te = predict_scores(model, Xte, task="clf")
+        pred_te = (proba_te >= 0.5).astype(int)
+        holdout = {
+            "ACC": accuracy_score(yte.astype(int), pred_te),
+            "PREC": precision_score(yte.astype(int), pred_te, zero_division=0),
+            "REC": recall_score(yte.astype(int), pred_te, zero_division=0),
+            "F1": f1_score(yte.astype(int), pred_te, zero_division=0),
+        }
+        try:
+            holdout["ROC"] = roc_auc_score(yte.astype(int), proba_te)
+        except Exception:
+            holdout["ROC"] = np.nan
 
-    print("Holdout (last segment):")
-    for k, v in holdout.items():
-        print(f"  {k:<4}: {v:.4f}")
-    print()
+        print("Holdout (last segment):")
+        for k, v in holdout.items():
+            print(f"  {k:<4}: {v:.4f}")
+        print()
+
+    else:
+        pred_te = predict_scores(model, Xte, task="reg")
+        holdout = {
+            "MAE": mean_absolute_error(yte.astype(float), pred_te.astype(float)),
+            "RMSE": np.sqrt(mean_squared_error(yte.astype(float), pred_te.astype(float))),
+            "R2": r2_score(yte.astype(float), pred_te.astype(float)),
+        }
+        print("Holdout (last segment):")
+        for k, v in holdout.items():
+            print(f"  {k:<4}: {v:.4f}")
+        print()
 
     # Feature importance
-    imp = feature_importance(model, X.columns.tolist())
+    imp = feature_importance(model, X.columns.tolist(), cfg.task)
     if not imp.empty:
         print("Top features:")
         print(imp.head(15).to_string())
@@ -505,24 +688,39 @@ def main():
     # --- Indicator diagnostics ---
     groups = group_features(X.columns.tolist())
 
-    # 1) Univariate AUC per feature
-    uni = univariate_holdout_auc(Xtr, ytr, Xte, yte)
-    print("\nPer-feature univariate ROC-AUC on holdout (top 20):")
-    print(uni.head(20).to_string(index=False))
+    # 1) Univariate diagnostics (holdout)
+    uni = univariate_holdout_diag(cfg.task, Xtr, ytr, Xte, yte)
+    if cfg.task == "clf":
+        print("\nPer-feature univariate ROC-AUC on holdout (top 20):")
+        print(uni.head(20).to_string(index=False))
+    else:
+        print("\nPer-feature univariate R2 on holdout (top 20):")
+        print(uni.head(20).to_string(index=False))
 
-    # 2) Group permutation importance (AUC drop)
-    gp = group_permutation_importance(model, Xte, yte, groups, n_repeats=5, seed=cfg.random_state)
-    print("\nGroup permutation importance (AUC drop on holdout):")
+    # 2) Group permutation importance
+    gp = group_permutation_importance(cfg.task, model, Xte, yte, groups, n_repeats=5, seed=cfg.random_state)
+    if cfg.task == "clf":
+        print("\nGroup permutation importance (AUC drop on holdout):")
+    else:
+        print("\nGroup permutation importance (R2 drop on holdout):")
     print(gp.to_string(index=False))
 
     # Preview last 10 predictions with dates
-    preview = pd.DataFrame({
-        "y_true": yte,
-        "y_prob_up": proba_te,
-        "y_pred_up": pred_te
-    }).tail(10)
+    if cfg.task == "clf":
+        preview = pd.DataFrame({
+            "y_true": yte.astype(int),
+            "y_prob_up": predict_scores(model, Xte, "clf"),
+            "y_pred_up": (predict_scores(model, Xte, "clf") >= 0.5).astype(int)
+        }).tail(10)
+    else:
+        preview = pd.DataFrame({
+            "y_true": yte.astype(float),
+            "y_pred": pred_te.astype(float)
+        }).tail(10)
+
     print("\nLast 10 predictions:")
     print(preview.to_string())
+
 
 if __name__ == "__main__":
     main()
