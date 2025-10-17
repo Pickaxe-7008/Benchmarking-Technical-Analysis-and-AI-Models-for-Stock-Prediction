@@ -15,13 +15,17 @@
 #      - MAE   : Mean Absolute Error (lower is better)
 #      - RMSE  : Root Mean Squared Error (lower is better)
 #      - R2    : Coefficient of Determination (higher is better)
+#      - DIR_ACC: Directional accuracy on train folds (sign correct)
 #      → Evaluates stability of the model on training data splits.
 #
 # 2) Holdout (last segment):
 #    Classification:
 #      - ACC, PREC, REC, F1, ROC (as above) → True out-of-sample performance.
+#      - HIT_RATE: Same as ACC (clarity).
+#
 #    Regression:
 #      - MAE, RMSE, R2 → True out-of-sample performance.
+#      - DIR_ACC: Directional accuracy (sign(pred) == sign(true))
 #
 # 3) Top features:
 #    - RandomForest (clf/reg) → "importance" = Gini/MSE-based importances
@@ -43,10 +47,10 @@
 #
 # 6) Last 10 predictions (from holdout):
 #    Classification:
-#      - y_true (0/1), y_prob_up, y_pred_up (threshold 0.5)
+#      - date, prev_close, y_true (0/1), y_prob_up, y_pred_up, pred_correct
 #    Regression:
-#      - y_true (future return over horizon), y_pred
-#    → Quick sanity check of most recent predictions.
+#      - date, prev_close, y_true (future return), y_pred, true_up, pred_up, correct_dir, abs_error
+#    → Adds an easy-to-interpret correctness flag and previous day's close for context.
 #
 # =============================================================================
 
@@ -82,7 +86,7 @@ from sklearn.metrics import (
 @dataclass
 class Config:
     # Core setup
-    ticker: str = "AAPL"           # Company symbol
+    ticker: str = "GOOG"           # Company symbol
     period_years: int = 5          # Fixed 5y history
     interval: str = "1d"           # Daily data
     horizon: int = 1               # Predict 1 day ahead
@@ -587,7 +591,7 @@ def walkforward_cv(task: str, model, X: pd.DataFrame, y: pd.Series, n_splits: in
         return {k: float(np.mean(v)) if v else np.nan for k, v in mets.items()}
 
     else:
-        mets = {"mae": [], "rmse": [], "r2": []}
+        mets = {"mae": [], "rmse": [], "r2": [], "dir_acc": []}
         for train_idx, val_idx in tscv.split(X):
             Xtr, Xva = X.iloc[train_idx], X.iloc[val_idx]
             ytr, yva = y.iloc[train_idx].astype(float), y.iloc[val_idx].astype(float)
@@ -597,6 +601,8 @@ def walkforward_cv(task: str, model, X: pd.DataFrame, y: pd.Series, n_splits: in
             mets["mae"].append(mean_absolute_error(yva, pred))
             mets["rmse"].append(np.sqrt(mean_squared_error(yva, pred)))
             mets["r2"].append(r2_score(yva, pred))
+            # Directional accuracy on validation
+            mets["dir_acc"].append(np.mean(np.sign(pred) == np.sign(yva)))
         return {k: float(np.mean(v)) if v else np.nan for k, v in mets.items()}
 
 
@@ -639,11 +645,14 @@ def main():
     cv_metrics = walkforward_cv(cfg.task, model, Xtr, ytr, cfg.n_splits)
     print("Walk-forward CV (train-only):")
     for k, v in cv_metrics.items():
-        print(f"  {k.upper():<5}: {v:.4f}")
+        print(f"  {k.upper():<7}: {v:.4f}")
     print()
 
     # Fit on full train and evaluate holdout
     model.fit(Xtr, ytr if cfg.task == "reg" else ytr.astype(int))
+
+    # Previous day's close aligned to Xte index (for contextual preview)
+    prev_close_holdout = raw["Close"].shift(1).reindex(Xte.index)
 
     if cfg.task == "clf":
         proba_te = predict_scores(model, Xte, task="clf")
@@ -658,11 +667,24 @@ def main():
             holdout["ROC"] = roc_auc_score(yte.astype(int), proba_te)
         except Exception:
             holdout["ROC"] = np.nan
+        # Explicit hit rate (same as ACC) for clarity
+        holdout["HIT_RATE"] = holdout["ACC"]
 
         print("Holdout (last segment):")
         for k, v in holdout.items():
-            print(f"  {k:<4}: {v:.4f}")
+            print(f"  {k:<8}: {v:.4f}")
         print()
+
+        # Preview last 10 with correctness and prev day's close
+        preview = pd.DataFrame({
+            "prev_close": prev_close_holdout,
+            "y_true": yte.astype(int),
+            "y_prob_up": proba_te,
+            "y_pred_up": pred_te,
+        })
+        preview["pred_correct"] = (preview["y_true"] == preview["y_pred_up"]).astype(int)
+        preview = preview.tail(10)
+        preview.index.name = "date"
 
     else:
         pred_te = predict_scores(model, Xte, task="reg")
@@ -671,10 +693,27 @@ def main():
             "RMSE": np.sqrt(mean_squared_error(yte.astype(float), pred_te.astype(float))),
             "R2": r2_score(yte.astype(float), pred_te.astype(float)),
         }
+        # Directional accuracy on holdout
+        dir_acc = np.mean(np.sign(pred_te) == np.sign(yte.astype(float)))
+        holdout["DIR_ACC"] = dir_acc
+
         print("Holdout (last segment):")
         for k, v in holdout.items():
-            print(f"  {k:<4}: {v:.4f}")
+            print(f"  {k:<8}: {v:.4f}")
         print()
+
+        # Preview last 10 with previous day's close, directional correctness, and abs error
+        preview = pd.DataFrame({
+            "prev_close": prev_close_holdout,
+            "y_true": yte.astype(float),
+            "y_pred": pred_te.astype(float),
+        })
+        preview["true_up"] = (preview["y_true"] > 0).astype(int)
+        preview["pred_up"] = (preview["y_pred"] > 0).astype(int)
+        preview["correct_dir"] = (preview["true_up"] == preview["pred_up"]).astype(int)
+        preview["abs_error"] = (preview["y_true"] - preview["y_pred"]).abs()
+        preview = preview.tail(10)
+        preview.index.name = "date"
 
     # Feature importance
     imp = feature_importance(model, X.columns.tolist(), cfg.task)
@@ -705,20 +744,8 @@ def main():
         print("\nGroup permutation importance (R2 drop on holdout):")
     print(gp.to_string(index=False))
 
-    # Preview last 10 predictions with dates
-    if cfg.task == "clf":
-        preview = pd.DataFrame({
-            "y_true": yte.astype(int),
-            "y_prob_up": predict_scores(model, Xte, "clf"),
-            "y_pred_up": (predict_scores(model, Xte, "clf") >= 0.5).astype(int)
-        }).tail(10)
-    else:
-        preview = pd.DataFrame({
-            "y_true": yte.astype(float),
-            "y_pred": pred_te.astype(float)
-        }).tail(10)
-
-    print("\nLast 10 predictions:")
+    # Enriched preview
+    print("\nLast 10 predictions (with previous day's close and correctness):")
     print(preview.to_string())
 
 
